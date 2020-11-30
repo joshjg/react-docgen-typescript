@@ -2,12 +2,12 @@ import {
   Component,
   ParserOptions,
   PropFilter,
-  PropItem,
+  PropItemWithOptionalType,
   StaticPropFilter
 } from './parser';
 
 export function buildFilter(opts: ParserOptions): PropFilter {
-  return (prop: PropItem, component: Component) => {
+  return (prop: PropItemWithOptionalType, component: Component) => {
     const { propFilter } = opts;
     // skip children property in case it has no custom documentation
     if (

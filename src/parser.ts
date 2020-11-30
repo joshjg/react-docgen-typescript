@@ -64,6 +64,10 @@ export interface PropItemType {
   name: string;
   value?: any;
   raw?: string;
+  properties?: Props;
+  arrayElementType?: PropItemType;
+  members?: PropItemType[];
+  typePath?: string[];
 }
 
 export interface ParentType {
@@ -71,7 +75,13 @@ export interface ParentType {
   fileName: string;
 }
 
-export type PropFilter = (props: PropItem, component: Component) => boolean;
+export type PropItemWithOptionalType = Omit<PropItem, 'type'> &
+  Partial<Pick<PropItem, 'type'>>;
+
+export type PropFilter = (
+  props: PropItemWithOptionalType,
+  component: Component
+) => boolean;
 
 export type ComponentNameResolver = (
   exp: ts.Symbol,
@@ -86,6 +96,7 @@ export interface ParserOptions {
   shouldExtractValuesFromUnion?: boolean;
   skipChildrenPropWithoutDoc?: boolean;
   savePropValueAsString?: boolean;
+  shouldParseNestedTypes?: boolean;
 }
 
 export interface StaticPropFilter {
@@ -207,17 +218,20 @@ const defaultJSDoc: JSDoc = {
 export class Parser {
   private checker: ts.TypeChecker;
   private propFilter: PropFilter;
+  private visitedSymbols = new Map<ts.Symbol, string[]>();
   private shouldRemoveUndefinedFromOptional: boolean;
   private shouldExtractLiteralValuesFromEnum: boolean;
   private shouldExtractValuesFromUnion: boolean;
   private savePropValueAsString: boolean;
+  private shouldParseNestedTypes: boolean;
 
   constructor(program: ts.Program, opts: ParserOptions) {
     const {
       savePropValueAsString,
       shouldExtractLiteralValuesFromEnum,
       shouldRemoveUndefinedFromOptional,
-      shouldExtractValuesFromUnion
+      shouldExtractValuesFromUnion,
+      shouldParseNestedTypes
     } = opts;
     this.checker = program.getTypeChecker();
     this.propFilter = buildFilter(opts);
@@ -229,6 +243,7 @@ export class Parser {
     );
     this.shouldExtractValuesFromUnion = Boolean(shouldExtractValuesFromUnion);
     this.savePropValueAsString = Boolean(savePropValueAsString);
+    this.shouldParseNestedTypes = Boolean(shouldParseNestedTypes);
   }
 
   private getComponentFromExpression(exp: ts.Symbol) {
@@ -343,7 +358,7 @@ export class Parser {
         commentSource,
         commentSource.valueDeclaration.getSourceFile()
       );
-      const props = this.getPropsInfo(propsType, defaultProps);
+      const props = this.getPropsInfoFromSymbol(propsType, defaultProps);
 
       for (const propName of Object.keys(props)) {
         const prop = props[propName];
@@ -547,10 +562,16 @@ export class Parser {
     return this.checker.typeToString(type);
   }
 
-  public getDocgenType(propType: ts.Type, isRequired: boolean): PropItemType {
+  public getDocgenType(
+    propType: ts.Type,
+    propSymbol: ts.Symbol,
+    path: string[],
+    isRequired: boolean
+  ): PropItemType {
     let propTypeString = this.checker.typeToString(propType);
 
-    if (propType.isUnion()) {
+    // "Simple" union member parsing
+    if (propType.isUnion() && !this.shouldParseNestedTypes) {
       if (this.shouldExtractValuesFromUnion) {
         return {
           name: 'enum',
@@ -580,31 +601,95 @@ export class Parser {
       propTypeString = propTypeString.replace(' | undefined', '');
     }
 
+    if (this.shouldParseNestedTypes) {
+      let baseType = propType;
+      if (propType.isUnion()) {
+        const filteredTypes = propType.types.filter(
+          type => !(type.flags & ts.TypeFlags.Undefined)
+        );
+        if (filteredTypes.length === 1) {
+          // The type is a union of T | undefined, and we only care about T
+          baseType = filteredTypes[0];
+        } else {
+          // The type is a union of more than just T | undefined, so format the types of all members
+          return {
+            name: propTypeString,
+            members: propType.types.map((memberType, i) =>
+              this.getDocgenType(
+                memberType,
+                propSymbol,
+                [...path, 'members', String(i)],
+                false
+              )
+            )
+          };
+        }
+      }
+
+      const isArrayType = (this.checker as any).isArrayType as (
+        type: ts.Type
+      ) => boolean;
+      if (isArrayType(baseType)) {
+        const getElementTypeOfArrayType = (this.checker as any)
+          .getElementTypeOfArrayType as (type: ts.Type) => ts.Type;
+        const elementType = getElementTypeOfArrayType(baseType);
+        return {
+          name: propTypeString,
+          // isArray: true,
+          arrayElementType: this.getDocgenType(
+            elementType,
+            propSymbol,
+            [...path, 'arrayElementType'],
+            false
+          )
+        };
+      }
+
+      if (propType.symbol) {
+        if (this.visitedSymbols.has(propType.symbol)) {
+          return {
+            name: propTypeString,
+            typePath: this.visitedSymbols.get(propType.symbol)
+          };
+        }
+        this.visitedSymbols.set(propType.symbol, path);
+      }
+
+      const typeNode = this.checker.typeToTypeNode(baseType);
+      const isFunctionLike = typeNode && ts.isFunctionLike(typeNode);
+      const isNonFunctionObject =
+        (baseType.flags & ts.TypeFlags.Object || baseType.isIntersection()) &&
+        !isFunctionLike;
+      if (isNonFunctionObject) {
+        return {
+          name: propTypeString,
+          properties: this.getPropsInfo(baseType, propSymbol, undefined, [
+            ...path,
+            'properties'
+          ])
+        };
+      }
+    }
+
     return { name: propTypeString };
   }
 
   public getPropsInfo(
-    propsObj: ts.Symbol,
-    defaultProps: StringIndexedObject<string> = {}
+    propsType: ts.Type,
+    contextSymbol: ts.Symbol,
+    defaultProps: StringIndexedObject<string> = {},
+    typePath: string[] = []
   ): Props {
-    if (!propsObj.valueDeclaration) {
-      return {};
-    }
-
-    const propsType = this.checker.getTypeOfSymbolAtLocation(
-      propsObj,
-      propsObj.valueDeclaration
-    );
     const baseProps = propsType.getApparentProperties();
     let propertiesOfProps = baseProps;
 
     if (propsType.isUnionOrIntersection()) {
       propertiesOfProps = [
+        // But props we already have override those as they are already correct.
+        ...baseProps,
         // Resolve extra properties in the union/intersection
         ...(propertiesOfProps = (this
-          .checker as any).getAllPossiblePropertiesOfTypes(propsType.types)),
-        // But props we already have override those as they are already correct.
-        ...baseProps
+          .checker as any).getAllPossiblePropertiesOfTypes(propsType.types))
       ];
 
       if (!propertiesOfProps.length) {
@@ -616,7 +701,7 @@ export class Parser {
           )
         );
 
-        propertiesOfProps = [...subTypes, ...baseProps];
+        propertiesOfProps = [...baseProps, ...subTypes];
       }
     }
 
@@ -625,10 +710,15 @@ export class Parser {
     propertiesOfProps.forEach(prop => {
       const propName = prop.getName();
 
+      if (result[propName]) {
+        // Prop with same name (key) can appear more than once due to the isUnionOrIntersection logic above
+        return;
+      }
+
       // Find type of prop by looking in context of the props object itself.
       const propType = this.checker.getTypeOfSymbolAtLocation(
         prop,
-        propsObj.valueDeclaration!
+        contextSymbol.valueDeclaration!
       );
 
       const jsDocComment = this.findDocComment(prop);
@@ -654,23 +744,45 @@ export class Parser {
         declarations.every(d => !d.questionToken) &&
         (!baseProp || !isOptional(baseProp));
 
-      const type = jsDocComment.tags.type
-        ? {
-            name: jsDocComment.tags.type
-          }
-        : this.getDocgenType(propType, required);
-
-      result[propName] = {
+      const info = {
         defaultValue,
         description: jsDocComment.fullComment,
         name: propName,
         parent,
-        required,
-        type
+        required
       };
+
+      if (
+        this.shouldParseNestedTypes &&
+        !this.propFilter(info, { name: 'unknown' })
+      ) {
+        return;
+      }
+
+      const type = jsDocComment.tags.type
+        ? {
+            name: jsDocComment.tags.type
+          }
+        : this.getDocgenType(propType, prop, [...typePath, propName], required);
+
+      result[propName] = { ...info, type };
     });
 
     return result;
+  }
+
+  public getPropsInfoFromSymbol(
+    propsObj: ts.Symbol,
+    defaultProps: StringIndexedObject<string> = {}
+  ): Props {
+    if (!propsObj.valueDeclaration) {
+      return {};
+    }
+    const propsType = this.checker.getTypeOfSymbolAtLocation(
+      propsObj,
+      propsObj.valueDeclaration
+    );
+    return this.getPropsInfo(propsType, propsObj, defaultProps);
   }
 
   public findDocComment(symbol: ts.Symbol): JSDoc {
@@ -909,8 +1021,12 @@ export class Parser {
         return this.savePropValueAsString ? 'false' : false;
       case ts.SyntaxKind.TrueKeyword:
         return this.savePropValueAsString ? 'true' : true;
-      case ts.SyntaxKind.StringLiteral:
-        return (initializer as ts.StringLiteral).text.trim();
+      case ts.SyntaxKind.StringLiteral: {
+        const trimmedString = (initializer as ts.StringLiteral).text.trim();
+        return this.savePropValueAsString
+          ? `"${trimmedString}"`
+          : trimmedString;
+      }
       case ts.SyntaxKind.PrefixUnaryExpression:
         return this.savePropValueAsString
           ? initializer.getFullText().trim()
